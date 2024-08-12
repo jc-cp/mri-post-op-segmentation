@@ -1,0 +1,3 @@
+"""
+Segmentation decoder for SimCLR.
+"""

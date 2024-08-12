@@ -1,0 +1,3 @@
+"""
+SimCLR encoder architecture.
+"""
