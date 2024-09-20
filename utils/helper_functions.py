@@ -8,25 +8,31 @@ from scipy.spatial.distance import directed_hausdorff
 import SimpleITK as sitk
 import wandb
 import os
+from pathlib import Path
 from collections import defaultdict
 import json
 import shutil
 
 def run_command(command):
-    process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    stdout, stderr = process.communicate()
-    if process.returncode != 0:
+    process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    while True:
+        output = process.stdout.readline()
+        if output == '' and process.poll() is not None:
+            break
+        if output:
+            print(output.strip())
+    rc = process.poll()
+    if rc != 0:
         print(f"Error executing command: {command}")
-        print(stderr.decode())
+        print(process.stderr.read())
         return False
-    else:
-        print(stdout.decode())
-        return True
+    return True
 
-def prepare_nnunet_data(nnunet_raw, base_dir, task_name):
+def prepare_nnunet_data(nnunet_raw, base_dir, task_name, max_cases=None):
     print(f"Preparing data for task: {task_name}")
     print(f"nnUNet raw data directory: {nnunet_raw}")
     print(f"Base directory: {base_dir}")
+    print(f"Maximum cases to load: {'All' if max_cases is None else max_cases}")
 
     # Ensure the nnUNet directory structure exists
     for subdir in ["imagesTr", "labelsTr", "imagesTs"]:
@@ -37,7 +43,6 @@ def prepare_nnunet_data(nnunet_raw, base_dir, task_name):
     def safe_copy(src, dst):
         try:
             shutil.copyfile(src, dst)
-            #print(f"Copied: {src} -> {dst}")
         except PermissionError:
             print(f"Permission error when copying {src}. Skipping this file.")
         except Exception as e:
@@ -47,15 +52,17 @@ def prepare_nnunet_data(nnunet_raw, base_dir, task_name):
     def group_files_by_case(files):
         cases = defaultdict(list)
         for file in files:
-            case_id = '-'.join(file.name.split('-')[:2])  # Include patient ID and scan ID
+            case_id = file.name.split('-')[0] + '_' + file.name.split('-')[1]
             cases[case_id].append(file)
         return cases
 
-    # Define modality order
+    # Define modality order and mapping
     modality_order = ['t1n', 't1c', 't2w', 't2f']
+    modality_mapping = {'t1n': '0000', 't1c': '0001', 't2w': '0002', 't2f': '0003'}
 
     # Copy and rename training and validation images and labels
     training_cases = []
+    case_count = 0
     for subset in ["training", "validation"]:
         print(f"Processing {subset} data...")
         image_files = list((base_dir / "images" / subset).glob("*.nii.gz"))
@@ -63,18 +70,23 @@ def prepare_nnunet_data(nnunet_raw, base_dir, task_name):
         grouped_images = group_files_by_case(image_files)
         
         for case_id, images in grouped_images.items():
+            if max_cases is not None and case_count >= max_cases:
+                print(f"Reached maximum number of cases ({max_cases}). Stopping data loading.")
+                break
+            
             print(f"Processing case: {case_id}")
             # Sort images by modality order
             images.sort(key=lambda x: modality_order.index(x.name.split('-')[-1].split('.')[0]))
             
             # Copy and rename images
-            for i, img in enumerate(images):
-                new_name = f"{case_id}_{i:04d}.nii.gz"
+            for img in images:
+                modality = img.name.split('-')[-1].split('.')[0]
+                new_name = f"{case_id}_{modality_mapping[modality]}.nii.gz"
                 safe_copy(img, nnunet_raw / "imagesTr" / new_name)
             
             # Find and copy label file
             label_file = None
-            label_patterns = [f"{case_id}-seg.nii.gz", f"{case_id}*seg.nii.gz", f"{case_id}*.nii.gz"]
+            label_patterns = [f"{case_id.replace('_', '-')}-seg.nii.gz", f"{case_id.replace('_', '-')}*seg.nii.gz", f"{case_id.replace('_', '-')}*.nii.gz"]
             for pattern in label_patterns:
                 label_files = list((base_dir / "labels" / subset).glob(pattern))
                 if label_files:
@@ -82,13 +94,20 @@ def prepare_nnunet_data(nnunet_raw, base_dir, task_name):
                     break
             
             if label_file:
-                # Change this line to match nnUNet's expectation
-                new_label_name = f"{case_id}_0000.nii.gz"
+                new_label_name = f"{case_id}.nii.gz"
                 safe_copy(label_file, nnunet_raw / "labelsTr" / new_label_name)
                 training_cases.append(case_id)
-                #print(f"Copied label file: {label_file} -> {nnunet_raw / 'labelsTr' / new_label_name}")
+                case_count += 1
+                print(f"Processed case {case_count}/{max_cases if max_cases is not None else 'All'}")
             else:
                 print(f"Warning: No label file found for case {case_id} in {subset} subset.")
+
+            if max_cases is not None and case_count >= max_cases:
+                print(f"Reached maximum number of cases ({max_cases}). Stopping data loading.")
+                break
+
+        if max_cases is not None and case_count >= max_cases:
+            break
 
     # Copy and rename test images
     test_cases = []
@@ -97,13 +116,21 @@ def prepare_nnunet_data(nnunet_raw, base_dir, task_name):
     print(f"Found {len(test_images)} test image files")
     grouped_test_images = group_files_by_case(test_images)
     
+    test_case_count = 0
     for case_id, images in grouped_test_images.items():
+        if max_cases is not None and test_case_count >= max_cases:
+            print(f"Reached maximum number of test cases ({max_cases}). Stopping test data loading.")
+            break
+        
         print(f"Processing test case: {case_id}")
         images.sort(key=lambda x: modality_order.index(x.name.split('-')[-1].split('.')[0]))
-        for i, img in enumerate(images):
-            new_name = f"{case_id}_{i:04d}.nii.gz"
+        for img in images:
+            modality = img.name.split('-')[-1].split('.')[0]
+            new_name = f"{case_id}_{modality_mapping[modality]}.nii.gz"
             safe_copy(img, nnunet_raw / "imagesTs" / new_name)
         test_cases.append(case_id)
+        test_case_count += 1
+        print(f"Processed test case {test_case_count}/{max_cases if max_cases is not None else 'All'}")
 
     # Create dataset.json
     dataset_json = {
@@ -128,15 +155,16 @@ def prepare_nnunet_data(nnunet_raw, base_dir, task_name):
         },
         "numTraining": len(training_cases),
         "numTest": len(test_cases),
-        "training": [{"image": f"./imagesTr/{case_id}_0000.nii.gz", "label": f"./labelsTr/{case_id}_0000.nii.gz"} for case_id in training_cases],
-        "test": [f"./imagesTs/{case_id}_0000.nii.gz" for case_id in test_cases]
+        "training": [{"image": f"./imagesTr/{case_id}.nii.gz", "label": f"./labelsTr/{case_id}.nii.gz"} for case_id in training_cases],
+        "test": [f"./imagesTs/{case_id}.nii.gz" for case_id in test_cases]
     }
+
     dataset_json_path = nnunet_raw / "dataset.json"
     with open(dataset_json_path, "w", encoding='utf-8') as f:
         json.dump(dataset_json, f, indent=4)
     print(f"Created dataset.json at {dataset_json_path}")
 
-    print(f"Data preparation completed for {task_name}, including validation files in the training set.")
+    print(f"Data preparation completed for {task_name}.")
     print(f"Task folder updated at: {nnunet_raw}")
     print(f"Total training cases: {len(training_cases)}")
     print(f"Total test cases: {len(test_cases)}")
@@ -187,6 +215,9 @@ def calculate_metrics(pred, gt):
     return np.mean(dsc_scores), np.mean(hd95_scores)
 
 def evaluate_fold(fold_output_dir, base_dir):
+    fold_output_dir = Path(fold_output_dir)
+    base_dir = Path(base_dir)
+    
     pred_dir = fold_output_dir / "validation_raw"
     gt_dir = base_dir / "labels" / "validation"  # Adjusted path based on our earlier structure
     
@@ -205,5 +236,6 @@ def evaluate_fold(fold_output_dir, base_dir):
     
     return np.mean(dsc_scores), np.mean(hd95_scores)
 
-def log_metrics_to_wandb(metrics, step):
-    wandb.log(metrics, step=step)
+def log_metrics_to_wandb(metrics, step=None):
+    for key, value in metrics.items():
+        wandb.log({key: value}, step=step)
